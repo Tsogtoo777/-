@@ -63,12 +63,16 @@ select,input,textarea{width:100%;padding:10px;border:1px solid #d8e0e8;border-ra
 <button class="active" data-page="dash">Dashboard</button>
 <button data-page="eq">Equipment</button>
 <button data-page="hour">Цагийн мэдээ</button>
+<button data-page="production">Бүтээл</button>
+<button data-page="report">Тайлан</button>
 </nav>
 
 <main>
 <section id="dash"></section>
 <section id="eq" style="display:none"></section>
 <section id="hour" style="display:none"></section>
+<section id="production" style="display:none"></section>
+<section id="report" style="display:none"></section>
 </main>
 <div id="msg"></div>
 <div id="statusModal" class="modal-backdrop">
@@ -89,7 +93,7 @@ select,input,textarea{width:100%;padding:10px;border:1px solid #d8e0e8;border-ra
         </label>
       </div>
       <div id="smuFields" style="display:block;margin-top:10px">
-        <div class="smu-note">Энэ төлөв дээр SMU/KM оруулах шаардлагатай.</div>
+        <div class="smu-note">SMU/KM оруулах боломжтой (заавал биш).</div>
         <div class="form-grid">
           <label>SMU / Мотоцаг<input id="eventSmu" type="number" step="0.1" min="0" placeholder="Жишээ: 18756.0"></label>
           <label>KM<input id="eventKm" type="number" step="0.1" min="0" placeholder="Жишээ: 92467.0"></label>
@@ -112,6 +116,7 @@ const API_KEY = "sb_publishable_sxW6qob3dT2O1vrCTBxZVw_6zs5HZTN";
 let equipment = [];
 let statuses = [];
 let events = [];
+let productionLogs = [];
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, function(c) {
@@ -162,7 +167,14 @@ async function loadData() {
       events = [];
     }
 
+    try {
+      productionLogs = await api("production_logs?select=*&order=created_at.desc&limit=2000");
+    } catch (_) {
+      productionLogs = [];
+    }
     render();
+    renderProduction();
+    renderReport();
   } catch (error) {
     const message = '<div class="err"><b>Supabase уншихад алдаа гарлаа.</b><br>' +
       esc(error.message) + '</div>';
@@ -183,7 +195,8 @@ const EXTRA_STATUSES = [
   "Геологи шалтгаалсан зогсолт",
   "Тос тосолгоо",
   "Тос тослох материал",
-  "Экскаватор төлөвлөгөөт засварт зогссон"
+  "Экскаватор төлөвлөгөөт засварт зогссон",
+  "Уул технологийн хүндрэл"
 ];
 
 function getOperators() {
@@ -294,8 +307,8 @@ async function setStatus(equipmentId, status, details) {
       method:"POST", headers:{"Prefer":"return=minimal"},
       body:JSON.stringify({
         equipment_id:equipmentId, status:status, start_time:now, operator_name:operator,
-        smu: needsSmu(status) ? Number(d.smu) : null,
-        km: needsSmu(status) ? Number(d.km) : null,
+        smu: needsSmu(status) && String(d.smu ?? "").trim() !== "" ? Number(d.smu) : null,
+        km: needsSmu(status) && String(d.km ?? "").trim() !== "" ? Number(d.km) : null,
         comment: String(d.comment || "").trim() || null
       })
     });
@@ -313,13 +326,15 @@ async function setStatus(equipmentId, status, details) {
 
 
 function showPage(page) {
-  ["dash","eq","hour"].forEach(function(id) {
+  ["dash","eq","hour","production","report"].forEach(function(id) {
     document.getElementById(id).style.display = id === page ? "block" : "none";
   });
   document.querySelectorAll("nav button").forEach(function(button) {
     button.classList.toggle("active", button.dataset.page === page);
   });
   if (page === "hour") renderHour();
+  if (page === "production") renderProduction();
+  if (page === "report") renderReport();
 }
 
 function render() {
@@ -370,9 +385,11 @@ function render() {
 function renderHour() {
   const selected = document.getElementById("hourSelect");
   const hour = selected ? Number(selected.value) : new Date().getHours();
-
+  const dateInput = document.getElementById("hourDate");
+  const day = dateInput ? dateInput.value : localDateValue();
   const list = events.filter(function(event) {
-    return new Date(event.start_time).getHours() === hour;
+    const d = new Date(event.start_time);
+    return d.getHours() === hour && localDateValue(d) === day;
   });
 
   document.getElementById("hour").innerHTML =
@@ -380,6 +397,7 @@ function renderHour() {
       '<b>Цагийн мэдээ</b><br>' +
       '<button class="primary" id="exportHour" style="margin:8px 0">📊 Excel татах</button>' +
       '<button id="exportAll" style="margin:8px 0 8px 6px">Бүх мэдээ</button>' +
+      '<label style="display:block;margin:8px 0">Огноо<input id="hourDate" type="date" value="'+esc(day)+'"></label>' +
       '<select id="hourSelect">' +
         Array.from({length:24}, function(_, i) {
           return '<option value="' + i + '"' + (i === hour ? " selected" : "") + '>' +
@@ -402,6 +420,110 @@ function renderHour() {
     '</div>';
 }
 
+
+function localDateValue(date) {
+  const d = date || new Date();
+  return [d.getFullYear(), String(d.getMonth()+1).padStart(2,"0"), String(d.getDate()).padStart(2,"0")].join("-");
+}
+function equipmentMeasure(item) {
+  const label = String((item && item.name) || "") + " " + String((item && item.equipment_type) || "");
+  if (/өрөм|дрилл|drill/i.test(label) || /410[- ]?0?[12]/i.test(label)) return "тууш метр";
+  if (/830/i.test(label)) return "рейс";
+  return "тоо";
+}
+function is830(item) {
+  return /830/i.test(String((item && item.name) || "") + " " + String((item && item.equipment_type) || ""));
+}
+const MATERIAL_TYPES = ["Хөрс", "Исэлдсэн хүдэр", "Балансын бус исэлдсэн хүдэр", "Бусад", "Замын дэвсэлт", "Шимт хөрс"];
+function renderProduction() {
+  const day = document.getElementById("productionDate")?.value || localDateValue();
+  const hour = Number(document.getElementById("productionHour")?.value ?? new Date().getHours());
+  const selected = document.getElementById("productionEquipment")?.value || "";
+  const itemOptions = equipment.map(x => '<option value="'+esc(x.id)+'"'+(String(x.id)===String(selected)?" selected":"")+'>'+esc(x.name)+' — '+esc(equipmentMeasure(x))+'</option>').join("");
+  const currentItem = equipment.find(x => String(x.id) === String(selected));
+  const dumps = equipment.filter(x => is830(x) || /дамп|автосамосвал|haul truck|dump truck/i.test(String(x.name)+" "+String(x.equipment_type)));
+  const dumpOptions = '<option value="">Дамп сонгох (заавал биш)</option>' + dumps.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.name)+'</option>').join("");
+  const materialOptions = '<option value="">Материал сонгох</option>' + MATERIAL_TYPES.map(x=>'<option value="'+esc(x)+'">'+esc(x)+'</option>').join("");
+  const filtered = productionLogs.filter(x => x.production_date === day && Number(x.hour_slot) === hour);
+  document.getElementById("production").innerHTML =
+    '<div class="card"><b>Цагийн бүтээлийн бүртгэл</b><p><small>Өрмийн бүтээлийг тууш метрээр, 830 техникийн бүтээлийг рейсээр бүртгэнэ. 830 дээр материалын төрлийг сонгоно.</small></p>'+
+    '<div class="form-grid"><label>Огноо<input id="productionDate" type="date" value="'+esc(day)+'"></label>'+
+    '<label>Цаг<select id="productionHour">'+Array.from({length:24},(_,i)=>'<option value="'+i+'"'+(i===hour?' selected':'')+'>'+String(i).padStart(2,"0")+':00–'+String((i+1)%24).padStart(2,"0")+':00</option>').join("")+'</select></label>'+
+    '<label>Техник<select id="productionEquipment">'+itemOptions+'</select></label>'+
+    '<label>Бүтээлийн хэмжээ<input id="productionAmount" type="number" min="0" step="0.1" placeholder="'+esc(equipmentMeasure(currentItem)||"Бүтээл")+'"></label>'+
+    '<label>Оператор<input id="productionOperator" placeholder="Операторын нэр"></label>'+
+    (is830(currentItem) ? '<label>Материалын төрөл<select id="productionMaterial" required>'+materialOptions+'</select></label>' : '')+
+    (is830(currentItem) ? '<label>Ачуулсан дамп<select id="productionDump">'+dumpOptions+'</select></label>' : '')+'</div>'+
+    '<label style="display:block;margin-top:8px">Тайлбар<input id="productionComment" placeholder="Нэмэлт тайлбар (заавал биш)"></label>'+
+    '<button class="primary" id="saveProduction" style="margin-top:10px">Бүтээл хадгалах</button></div>'+
+    '<div class="card"><b>'+esc(day)+' · '+String(hour).padStart(2,"0")+':00 цагийн бүртгэл</b>'+
+    (filtered.length ? filtered.map(x=>{const eq=equipment.find(e=>String(e.id)===String(x.equipment_id)); const dump=equipment.find(e=>String(e.id)===String(x.dump_equipment_id)); return '<div class="log"><b>'+esc(eq?eq.name:x.equipment_id)+'</b><span>'+esc(x.amount)+' '+esc(x.measure_type)+'</span><span>'+esc(x.operator_name||"-")+'</span><span>'+(x.material_type?'Материал: '+esc(x.material_type)+' · ':'')+(dump?'Дамп: '+esc(dump.name)+' · ':'')+esc(x.comment||"")+'</span></div>';}).join("") : '<p><small>Энэ цагт бүтээлийн бүртгэл алга.</small></p>')+'</div>';
+}
+async function saveProduction() {
+  const equipmentId = document.getElementById("productionEquipment")?.value;
+  const item = equipment.find(x=>String(x.id)===String(equipmentId));
+  const amount = Number(document.getElementById("productionAmount")?.value);
+  const day = document.getElementById("productionDate")?.value || localDateValue();
+  const hour = Number(document.getElementById("productionHour")?.value);
+  if (!item) return toast("Техникээ сонгоно уу.");
+  if (!Number.isFinite(amount) || amount < 0 || document.getElementById("productionAmount").value === "") return toast("Бүтээлийн хэмжээг зөв оруулна уу.");
+  if (is830(item) && !document.getElementById("productionMaterial")?.value) return toast("830 техникийн материалын төрлийг сонгоно уу.");
+  const row = {
+    production_date: day, hour_slot: hour, equipment_id: item.id,
+    measure_type: equipmentMeasure(item), amount: amount,
+    operator_name: document.getElementById("productionOperator").value.trim() || getOperator(item.id) || null,
+    dump_equipment_id: document.getElementById("productionDump")?.value || null,
+    material_type: is830(item) ? (document.getElementById("productionMaterial")?.value || null) : null,
+    comment: document.getElementById("productionComment").value.trim() || null
+  };
+  try {
+    await api("production_logs", {method:"POST",headers:{"Prefer":"return=minimal"},body:JSON.stringify(row)});
+    toast("Бүтээлийн мэдээ хадгалагдлаа.");
+    productionLogs = await api("production_logs?select=*&order=created_at.desc&limit=2000");
+    renderProduction();
+  } catch(e) {
+    toast("Хадгалах алдаа: "+e.message+" (SQL migration ажиллуулсан эсэхийг шалга)");
+  }
+}
+function renderReport() {
+  const day = document.getElementById("reportDate")?.value || localDateValue();
+  const dailyEvents = events.filter(e=>localDateValue(new Date(e.start_time))===day);
+  const dailyProduction = productionLogs.filter(e=>e.production_date===day);
+  const byStatus = {};
+  dailyEvents.forEach(e=>{
+    const start=new Date(e.start_time).getTime();
+    const end=e.end_time?new Date(e.end_time).getTime():Date.now();
+    byStatus[e.status]=(byStatus[e.status]||0)+Math.max(0,end-start);
+  });
+  const durationRows=Object.keys(byStatus).sort().map(s=>'<div class="log"><b>'+esc(s)+'</b><span>'+((byStatus[s]/3600000).toFixed(2))+' цаг</span><span></span><span></span></div>').join("");
+  const prodRows=dailyProduction.map(x=>{const eq=equipment.find(e=>String(e.id)===String(x.equipment_id));return '<div class="log"><b>'+esc(eq?eq.name:x.equipment_id)+'</b><span>'+esc(x.amount)+' '+esc(x.measure_type)+'</span><span>'+esc(x.hour_slot)+':00</span><span>'+(x.material_type?esc(x.material_type)+' · ':'')+esc(x.operator_name||"-")+'</span></div>';}).join("");
+  document.getElementById("report").innerHTML='<div class="card"><b>Өдөр / ээлжийн тайлан</b><label style="display:block;margin-top:8px">Огноо<input id="reportDate" type="date" value="'+esc(day)+'"></label><button class="primary" id="exportDailyReport" style="margin-top:8px">Өдрийн тайлан Excel татах</button></div>'+
+  '<div class="stats"><div class="stat">Төлөвийн бүртгэл<b>'+dailyEvents.length+'</b></div><div class="stat">Бүтээлийн бүртгэл<b>'+dailyProduction.length+'</b></div><div class="stat">Тууш метр<b>'+dailyProduction.filter(x=>x.measure_type==="тууш метр").reduce((a,x)=>a+Number(x.amount||0),0).toLocaleString("mn-MN")+'</b></div><div class="stat">Рейс<b>'+dailyProduction.filter(x=>x.measure_type==="рейс").reduce((a,x)=>a+Number(x.amount||0),0).toLocaleString("mn-MN")+'</b></div></div>'+
+  '<div class="card"><b>Төлөвт зарцуулсан хугацаа (ойролцоо)</b><small>Бүртгэлийн эхлэл/төгсгөлөөр тооцсон; нээлттэй төлөв өнөөг хүртэл тооцогдоно.</small>'+(durationRows||'<p><small>Төлөвийн бүртгэл алга.</small></p>')+'</div>'+
+  '<div class="card"><b>Өдрийн бүтээл</b>'+(prodRows||'<p><small>Бүтээлийн бүртгэл алга.</small></p>')+'</div>';
+}
+function exportDailyReport() {
+  if (typeof XLSX === "undefined") return toast("Excel модуль ачаалагдаагүй байна.");
+  const day=document.getElementById("reportDate")?.value||localDateValue();
+  const ev=events.filter(e=>localDateValue(new Date(e.start_time))===day).map(e=>({
+    "Огноо":day,"Техник":(equipment.find(x=>String(x.id)===String(e.equipment_id))||{}).name||e.equipment_id,
+    "Төлөв":e.status,"Эхэлсэн":new Date(e.start_time).toLocaleString("mn-MN"),
+    "Дууссан":e.end_time?new Date(e.end_time).toLocaleString("mn-MN"):"Одоог хүртэл",
+    "Оператор":e.operator_name||"","SMU":e.smu??"","KM":e.km??"","Тайлбар":e.comment||""
+  }));
+  const pr=productionLogs.filter(x=>x.production_date===day).map(x=>({
+    "Огноо":x.production_date,"Цаг":x.hour_slot+":00",
+    "Техник":(equipment.find(e=>String(e.id)===String(x.equipment_id))||{}).name||x.equipment_id,
+    "Бүтээл":x.amount,"Нэгж":x.measure_type,"Материалын төрөл":x.material_type||"","Оператор":x.operator_name||"",
+    "Дамп":(equipment.find(e=>String(e.id)===String(x.dump_equipment_id))||{}).name||"",
+    "Тайлбар":x.comment||""
+  }));
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(ev.length?ev:[{"Мэдээлэл":"Төлөвийн бүртгэл алга"}]),"Төлөвийн бүртгэл");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(pr.length?pr:[{"Мэдээлэл":"Бүтээлийн бүртгэл алга"}]),"Бүтээл");
+  XLSX.writeFile(wb,"Data_Event_Tailan_"+day+".xlsx");
+}
+
 function exportHour() {
   if (typeof XLSX === "undefined") {
     toast("Excel модуль ачаалагдаагүй байна.");
@@ -409,9 +531,11 @@ function exportHour() {
   }
   const select = document.getElementById("hourSelect");
   const hour = select ? Number(select.value) : new Date().getHours();
+  const day = document.getElementById("hourDate")?.value || localDateValue();
 
   const rows = events.filter(function(event) {
-    return new Date(event.start_time).getHours() === hour;
+    const d = new Date(event.start_time);
+    return d.getHours() === hour && localDateValue(d) === day;
   }).map(function(event) {
     const item = equipment.find(function(x){ return String(x.id) === String(event.equipment_id); });
     return {
@@ -430,7 +554,7 @@ function exportHour() {
   const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{"Мэдээлэл":"Сонгосон цагт event байхгүй"}]);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Цагийн мэдээ");
-  XLSX.writeFile(wb, "Data_Event_" + String(hour).padStart(2,"0") + "00.xlsx");
+  XLSX.writeFile(wb, "Data_Event_" + day + "_" + String(hour).padStart(2,"0") + "00.xlsx");
 }
 
 function exportAll() {
@@ -523,7 +647,10 @@ document.addEventListener("click", function(event) {
 
   if (event.target.id === "exportAll") {
     exportAll();
+    return;
   }
+  if (event.target.id === "saveProduction") { saveProduction(); return; }
+  if (event.target.id === "exportDailyReport") { exportDailyReport(); return; }
 });
 
 document.addEventListener("input", function(event) {
@@ -531,7 +658,9 @@ document.addEventListener("input", function(event) {
 });
 
 document.addEventListener("change", function(event) {
-  if (event.target.id === "hourSelect") renderHour();
+  if (event.target.id === "hourSelect" || event.target.id === "hourDate") renderHour();
+  if (event.target.id === "productionDate" || event.target.id === "productionHour" || event.target.id === "productionEquipment") renderProduction();
+  if (event.target.id === "reportDate") renderReport();
 });
 
 loadData();
