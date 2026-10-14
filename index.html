@@ -140,6 +140,8 @@ let equipment = [];
 let statuses = [];
 let events = [];
 let productionLogs = [];
+let sharedOperators = {};
+let operatorSyncReady = false;
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, function(c) {
@@ -195,6 +197,10 @@ async function loadData() {
     } catch (_) {
       productionLogs = [];
     }
+    // Operator names are shared in Supabase, not browser storage.
+    const operatorRows = await api("equipment_operator_names?select=equipment_id,operator_name");
+    sharedOperators = Object.fromEntries(operatorRows.map(row => [String(row.equipment_id), String(row.operator_name || "")]));
+    operatorSyncReady = true;
     render();
     renderProduction();
     renderReport();
@@ -222,28 +228,51 @@ const EXTRA_STATUSES = [
   "Уул технологийн хүндрэл"
 ];
 
-function getOperators() {
+function getLocalOperatorsForImport() {
   try { return JSON.parse(localStorage.getItem("data_event_operators") || "{}"); }
   catch (_) { return {}; }
 }
 
 function getOperator(equipmentId) {
-  const operators = getOperators();
-  return String(operators[equipmentId] || "").trim();
+  return String(sharedOperators[String(equipmentId)] || "").trim();
 }
 
-function saveOperator(equipmentId, value) {
-  const operators = getOperators();
+async function saveOperator(equipmentId, value) {
+  if (!operatorSyncReady) { toast("Операторын мэдээлэл ачаалагдаагүй байна."); return false; }
+  const id = String(equipmentId);
   const name = String(value || "").trim();
-  if (name) operators[equipmentId] = name;
-  else delete operators[equipmentId];
-  localStorage.setItem("data_event_operators", JSON.stringify(operators));
+  try {
+    // Upsert only the named equipment; no other equipment is affected.
+    await api("equipment_operator_names?on_conflict=equipment_id", {
+      method:"POST",
+      headers:{"Prefer":"resolution=merge-duplicates,return=minimal"},
+      body:JSON.stringify({equipment_id:id,operator_name:name})
+    });
+    sharedOperators[id] = name;
+    return true;
+  } catch (error) {
+    toast("Оператор хадгалах алдаа: " + error.message);
+    return false;
+  }
 }
 
-function clearOperator(equipmentId) {
-  saveOperator(equipmentId, "");
-  const input = document.querySelector('[data-operator-id="' + CSS.escape(String(equipmentId)) + '"]');
-  if (input) input.value = "";
+async function clearOperator(equipmentId) {
+  if (!confirm("Энэ техникийн операторын нэрийг бүх төхөөрөмжөөс цэвэрлэх үү?")) return;
+  const ok = await saveOperator(equipmentId, "");
+  if (ok) { render(); showPage("eq"); }
+}
+
+async function importLocalOperators() {
+  const local = getLocalOperatorsForImport();
+  const rows = Object.entries(local).filter(([id,name]) => String(name || "").trim() && !getOperator(id));
+  if (!rows.length) { toast("Шилжүүлэх нэр олдсонгүй."); return; }
+  if (!confirm(rows.length + " операторын нэрийг Supabase-д шилжүүлэх үү? Одоо серверт байгаа нэрсийг солихгүй.")) return;
+  let count=0;
+  for (const [id,name] of rows) {
+    if (await saveOperator(id,name)) count++;
+  }
+  toast(count + " операторын нэр шилжлээ.");
+  render(); showPage("eq");
 }
 
 function allStatuses() {
@@ -385,7 +414,7 @@ function render() {
     '</div>';
 
   document.getElementById("eq").innerHTML =
-    '<div class="card"><b>Техник бүрийн оператор</b><br><small>Операторыг техник бүр дээр тусад нь хадгална. SMU/KM оруулж болно. Comment нь засвар, Idle, Down төрлийн төлөвт харагдана.</small></div>' +
+    '<div class="card"><b>Техник бүрийн оператор</b><br><small>Операторыг техник бүр дээр тусад нь хадгална. SMU/KM оруулж болно. Comment нь засвар, Idle, Down төрлийн төлөвт харагдана.</small><br><button id="importOperators" style="margin-top:8px">Энэ компьютерийн хуучин операторын нэрсийг шилжүүлэх</button></div>' +
     '<div class="grid">' +
     equipment.map(function(x) {
       const operator = getOperator(x.id);
@@ -533,16 +562,28 @@ function renderReport() {
   '<div class="card"><b>Төлөвт зарцуулсан хугацаа (ойролцоо)</b><small>Бүртгэлийн эхлэл/төгсгөлөөр тооцсон; нээлттэй төлөв өнөөг хүртэл тооцогдоно.</small>'+(durationRows||'<p><small>Төлөвийн бүртгэл алга.</small></p>')+'</div>'+
   '<div class="card"><b>Өдрийн бүтээл</b>'+(prodRows||'<p><small>Бүтээлийн бүртгэл алга.</small></p>')+'</div>';
 }
+// Excel export only: sort copies, never mutate the original data arrays.
+function exportEventsOldestFirst(items) {
+  return [...items].sort((a,b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime());
+}
+function exportProductionOldestFirst(items) {
+  const key=x=>{
+    const day=String(x.production_date||'');
+    const hour=Number(x.hour_slot);
+    return day && Number.isFinite(hour) ? Date.parse(day+'T'+String(hour).padStart(2,'0')+':00:00') : Infinity;
+  };
+  return [...items].sort((a,b)=>key(a)-key(b));
+}
 function exportDailyReport() {
   if (typeof XLSX === "undefined") return toast("Excel модуль ачаалагдаагүй байна.");
   const day=document.getElementById("reportDate")?.value||localDateValue();
-  const ev=events.filter(e=>localDateValue(new Date(e.start_time))===day).map(e=>({
+  const ev=exportEventsOldestFirst(events.filter(e=>localDateValue(new Date(e.start_time))===day)).map(e=>({
     "Огноо":day,"Техник":(equipment.find(x=>String(x.id)===String(e.equipment_id))||{}).name||e.equipment_id,
     "Төлөв":e.status,"Эхэлсэн":new Date(e.start_time).toLocaleString("mn-MN"),
     "Дууссан":e.end_time?new Date(e.end_time).toLocaleString("mn-MN"):"Одоог хүртэл",
     "Оператор":e.operator_name||"","SMU":e.smu??"","KM":e.km??"","Тайлбар":e.comment||""
   }));
-  const pr=productionLogs.filter(x=>x.production_date===day).map(x=>({
+  const pr=exportProductionOldestFirst(productionLogs.filter(x=>x.production_date===day)).map(x=>({
     "Огноо":x.production_date,"Цаг":x.hour_slot+":00",
     "Техник":(equipment.find(e=>String(e.id)===String(x.equipment_id))||{}).name||x.equipment_id,
     "Ажлын төрөл":x.production_type||"","Цооногийн тоо":x.hole_count??"","Бүтээл":x.amount,"Нэгж":x.measure_type,"Материалын төрөл":x.material_type||"","Оператор":x.operator_name||"",
@@ -564,10 +605,10 @@ function exportHour() {
   const hour = select ? Number(select.value) : new Date().getHours();
   const day = document.getElementById("hourDate")?.value || localDateValue();
 
-  const rows = events.filter(function(event) {
+  const rows = exportEventsOldestFirst(events.filter(function(event) {
     const d = new Date(event.start_time);
     return d.getHours() === hour && localDateValue(d) === day;
-  }).map(function(event) {
+  })).map(function(event) {
     const item = equipment.find(function(x){ return String(x.id) === String(event.equipment_id); });
     return {
       "Огноо":new Date(event.start_time).toLocaleDateString("mn-MN"),
@@ -582,9 +623,9 @@ function exportHour() {
     };
   });
 
-  const productionRows = productionLogs.filter(function(x) {
+  const productionRows = exportProductionOldestFirst(productionLogs.filter(function(x) {
     return x.production_date === day && Number(x.hour_slot) === hour;
-  }).map(function(x) {
+  })).map(function(x) {
     const item = equipment.find(function(e){ return String(e.id) === String(x.equipment_id); });
     const dump = equipment.find(function(e){ return String(e.id) === String(x.dump_equipment_id); });
     return {
@@ -612,7 +653,7 @@ function exportAll() {
     return;
   }
 
-  const rows = events.map(function(event) {
+  const rows = exportEventsOldestFirst(events).map(function(event) {
     const item = equipment.find(function(x){ return String(x.id) === String(event.equipment_id); });
     return {
       "Огноо":new Date(event.start_time).toLocaleDateString("mn-MN"),
@@ -636,7 +677,7 @@ function exportAll() {
     };
   });
 
-  const productionRows = productionLogs.map(function(x) {
+  const productionRows = exportProductionOldestFirst(productionLogs).map(function(x) {
     const item = equipment.find(function(e){ return String(e.id) === String(x.equipment_id); });
     const dump = equipment.find(function(e){ return String(e.id) === String(x.dump_equipment_id); });
     return {
@@ -660,7 +701,7 @@ function exportAll() {
   XLSX.writeFile(wb, "Data_Event_Buh_Medee.xlsx");
 }
 
-document.addEventListener("click", function(event) {
+document.addEventListener("click", async function(event) {
   const pageButton = event.target.closest("nav button[data-page]");
   if (pageButton) {
     showPage(pageButton.dataset.page);
@@ -696,9 +737,7 @@ document.addEventListener("click", function(event) {
 
   const clearButton = event.target.closest("[data-clear-operator-id]");
   if (clearButton) {
-    clearOperator(clearButton.dataset.clearOperatorId);
-    render();
-    showPage("eq");
+    await clearOperator(clearButton.dataset.clearOperatorId);
     return;
   }
 
@@ -706,6 +745,8 @@ document.addEventListener("click", function(event) {
     closeStatusModal();
     return;
   }
+
+  if (event.target.id === "importOperators") { await importLocalOperators(); return; }
 
   if (event.target.id === "exportHour") {
     exportHour();
@@ -720,8 +761,11 @@ document.addEventListener("click", function(event) {
   if (event.target.id === "exportDailyReport") { exportDailyReport(); return; }
 });
 
-document.addEventListener("input", function(event) {
-  if (event.target.matches("[data-operator-id]")) saveOperator(event.target.dataset.operatorId, event.target.value);
+document.addEventListener("change", async function(event) {
+  if (!event.target.matches("[data-operator-id]")) return;
+  const input=event.target;
+  const ok=await saveOperator(input.dataset.operatorId,input.value);
+  if (!ok) input.value=getOperator(input.dataset.operatorId);
 });
 
 document.addEventListener("change", function(event) {
